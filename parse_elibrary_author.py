@@ -1,5 +1,6 @@
 import argparse
 import csv
+import os
 import random
 import re
 import time
@@ -36,6 +37,23 @@ USER_AGENTS = [
 ]
 
 
+CSV_FIELDNAMES = [
+    "author_id",
+    "item_id",
+    "item_url",
+    "title",
+    "authors",
+    "certificate_or_type",
+    "journal_name",
+    "journal_url",
+    "issue",
+    "issue_url",
+    "keywords",
+    "abstract",
+    "details_fetched",
+]
+
+
 @dataclass(frozen=True)
 class Publication:
     author_id: str
@@ -48,6 +66,9 @@ class Publication:
     journal_url: str
     issue: str
     issue_url: str
+    keywords: str = ""
+    abstract: str = ""
+    details_fetched: str = ""
 
 
 def _sleep_polite(min_s: float, max_s: float) -> None:
@@ -297,6 +318,183 @@ def _parse_publications_from_html(author_id: str, html: str) -> list[Publication
     return pubs
 
 
+def _parse_item_details(html: str) -> tuple[str, str]:
+    """Extract keywords and abstract from an item.asp page."""
+    soup = BeautifulSoup(html, "lxml")
+    keywords: list[str] = []
+    abstract = ""
+
+    for tr in soup.find_all("tr"):
+        font = tr.find("font")
+        if not font:
+            continue
+        label = _clean_space(font.get_text(" ", strip=True))
+        nxt = tr.find_next_sibling("tr")
+        if not nxt:
+            continue
+        if "КЛЮЧЕВЫЕ СЛОВА" in label:
+            keywords = [
+                _clean_space(a.get_text(" ", strip=True))
+                for a in nxt.find_all("a", href=re.compile(r"keyword_items\.asp"))
+            ]
+        elif "АННОТАЦИЯ" in label:
+            div = nxt.find("div", id="abstract1")
+            if div:
+                p = div.find("p")
+                abstract = _clean_space((p or div).get_text(" ", strip=True))
+
+    return "; ".join(keywords), abstract
+
+
+def _publication_to_row(p: Publication) -> dict[str, str]:
+    return {
+        "author_id": p.author_id,
+        "item_id": p.item_id or "",
+        "item_url": p.item_url,
+        "title": p.title,
+        "authors": p.authors,
+        "certificate_or_type": p.certificate_or_type,
+        "journal_name": p.journal_name,
+        "journal_url": p.journal_url,
+        "issue": p.issue,
+        "issue_url": p.issue_url,
+        "keywords": p.keywords,
+        "abstract": p.abstract,
+        "details_fetched": p.details_fetched,
+    }
+
+
+def _publication_from_row(row: dict[str, str]) -> Publication:
+    return Publication(
+        author_id=row.get("author_id", ""),
+        item_id=row.get("item_id") or None,
+        item_url=row.get("item_url", ""),
+        title=row.get("title", ""),
+        authors=row.get("authors", ""),
+        certificate_or_type=row.get("certificate_or_type", ""),
+        journal_name=row.get("journal_name", ""),
+        journal_url=row.get("journal_url", ""),
+        issue=row.get("issue", ""),
+        issue_url=row.get("issue_url", ""),
+        keywords=row.get("keywords", ""),
+        abstract=row.get("abstract", ""),
+        details_fetched=row.get("details_fetched", ""),
+    )
+
+
+def load_csv(path: str) -> list[Publication]:
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        return [_publication_from_row(row) for row in reader]
+
+
+def _warmup_session(session) -> None:
+    _fetch_html(session, BASE_URL)
+    _sleep_polite(0.6, 1.2)
+
+
+def enrich_publications(
+    pubs: list[Publication],
+    session,
+    *,
+    skip_fetched: bool = True,
+    save_path: Optional[str] = None,
+) -> tuple[int, int]:
+    """
+    Fetch keywords and abstract for each publication via item_url.
+
+    Returns (enriched_count, skipped_count).
+    If save_path is set, writes CSV after each successful item fetch (resume-friendly).
+    """
+    enriched = 0
+    skipped = 0
+    result = list(pubs)
+
+    for i, p in enumerate(result):
+        if skip_fetched and p.details_fetched == "1":
+            skipped += 1
+            continue
+        if not p.item_url:
+            skipped += 1
+            continue
+
+        _sleep_polite(0.7, 1.6)
+        html = _fetch_html(session, p.item_url)
+        if _looks_like_access_error(html):
+            raise RuntimeError(
+                f"eLibrary вернул ошибку доступа при загрузке {p.item_url}."
+            )
+
+        keywords, abstract = _parse_item_details(html)
+        result[i] = Publication(
+            author_id=p.author_id,
+            item_id=p.item_id,
+            item_url=p.item_url,
+            title=p.title,
+            authors=p.authors,
+            certificate_or_type=p.certificate_or_type,
+            journal_name=p.journal_name,
+            journal_url=p.journal_url,
+            issue=p.issue,
+            issue_url=p.issue_url,
+            keywords=keywords,
+            abstract=abstract,
+            details_fetched="1",
+        )
+        enriched += 1
+
+        if save_path:
+            save_csv(save_path, result)
+
+    return enriched, skipped
+
+
+def enrich_csv(
+    path: str,
+    *,
+    skip_fetched: bool = True,
+    force: bool = False,
+) -> tuple[int, int, int]:
+    """
+    Enrich an existing CSV with keywords and abstract.
+
+    Returns (total_rows, enriched_count, skipped_count).
+    """
+    pubs = load_csv(path)
+    if not pubs:
+        return 0, 0, 0
+
+    if force:
+        pubs = [
+            Publication(
+                author_id=p.author_id,
+                item_id=p.item_id,
+                item_url=p.item_url,
+                title=p.title,
+                authors=p.authors,
+                certificate_or_type=p.certificate_or_type,
+                journal_name=p.journal_name,
+                journal_url=p.journal_url,
+                issue=p.issue,
+                issue_url=p.issue_url,
+                keywords=p.keywords,
+                abstract=p.abstract,
+                details_fetched="",
+            )
+            for p in pubs
+        ]
+
+    session = _make_session()
+    _warmup_session(session)
+    enriched, skipped = enrich_publications(
+        pubs,
+        session,
+        skip_fetched=skip_fetched,
+        save_path=path,
+    )
+    return len(pubs), enriched, skipped
+
+
 def _fetch_author_page(
     session,
     *,
@@ -364,36 +562,11 @@ def _iter_pages(
 
 
 def save_csv(path: str, pubs: list[Publication]) -> None:
-    fieldnames = [
-        "author_id",
-        "item_id",
-        "item_url",
-        "title",
-        "authors",
-        "certificate_or_type",
-        "journal_name",
-        "journal_url",
-        "issue",
-        "issue_url",
-    ]
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDNAMES)
         w.writeheader()
         for p in pubs:
-            w.writerow(
-                {
-                    "author_id": p.author_id,
-                    "item_id": p.item_id or "",
-                    "item_url": p.item_url,
-                    "title": p.title,
-                    "authors": p.authors,
-                    "certificate_or_type": p.certificate_or_type,
-                    "journal_name": p.journal_name,
-                    "journal_url": p.journal_url,
-                    "issue": p.issue,
-                    "issue_url": p.issue_url,
-                }
-            )
+            w.writerow(_publication_to_row(p))
 
 
 def parse_author_to_csv(
@@ -401,6 +574,8 @@ def parse_author_to_csv(
     out_path: str,
     *,
     max_runs: int = 3,
+    enrich: bool = False,
+    enrich_force: bool = False,
 ) -> tuple[Optional[int], int]:
     """
     Parses all publications for author and writes CSV.
@@ -435,6 +610,10 @@ def parse_author_to_csv(
                     )
 
             save_csv(out_path, all_pubs)
+
+            if enrich:
+                enrich_csv(out_path, skip_fetched=not enrich_force, force=enrich_force)
+
             return total_found, len(all_pubs)
         except Exception as e:
             last_err = e
@@ -451,15 +630,48 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--authorid", required=True, help="ID автора eLibrary, например 707733")
     ap.add_argument("--out", default="", help="Путь к CSV. По умолчанию author_<id>.csv")
+    ap.add_argument(
+        "--enrich",
+        action="store_true",
+        help="После парсинга списка обогатить CSV ключевыми словами и аннотациями",
+    )
+    ap.add_argument(
+        "--enrich-only",
+        action="store_true",
+        help="Только обогатить существующий CSV (без повторного парсинга списка)",
+    )
+    ap.add_argument(
+        "--enrich-force",
+        action="store_true",
+        help="Перезагрузить детали для всех публикаций, даже если уже обогащены",
+    )
     args = ap.parse_args()
 
     author_id = str(args.authorid).strip()
     out = args.out.strip() or f"author_{author_id}.csv"
 
-    total_found, saved = parse_author_to_csv(author_id, out)
+    if args.enrich_only:
+        if not os.path.exists(out):
+            raise SystemExit(f"CSV не найден: {out}")
+        total, enriched, skipped = enrich_csv(
+            out,
+            skip_fetched=not args.enrich_force,
+            force=args.enrich_force,
+        )
+        print(f"Enriched: {enriched}, skipped: {skipped}, total: {total} ({out})")
+        return 0
+
+    total_found, saved = parse_author_to_csv(
+        author_id,
+        out,
+        enrich=args.enrich,
+        enrich_force=args.enrich_force,
+    )
     if total_found is not None:
         print(f"Total found on site: {total_found}")
     print(f"Saved to CSV: {saved} ({out})")
+    if args.enrich:
+        print("(Details enrichment completed during parse)")
     return 0
 
 

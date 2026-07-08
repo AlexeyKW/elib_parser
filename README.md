@@ -16,6 +16,21 @@ python parse_elibrary_author.py --authorid 707733
 
 По умолчанию создаст файл `author_707733.csv` (кодировка `UTF-8-SIG`, удобно для Excel).
 
+### Обогащение (ключевые слова и аннотация)
+
+```bash
+# Список + детали за один запуск
+python parse_elibrary_author.py --authorid 707733 --enrich
+
+# Только обогатить существующий CSV
+python parse_elibrary_author.py --authorid 707733 --enrich-only
+
+# Перезагрузить детали для всех публикаций
+python parse_elibrary_author.py --authorid 707733 --enrich-only --enrich-force
+```
+
+При обогащении для каждой публикации открывается `item_url`. Прогресс сохраняется после каждой записи; уже обработанные строки (`details_fetched=1`) пропускаются.
+
 ## Docker-сервис
 
 Сервис поднимает HTTP API и сохраняет CSV в локальную папку `./data` (смонтирована в контейнер как `/data`).
@@ -32,17 +47,24 @@ docker compose up --build
 - `GET /parse/{authorid}` — запускает парсинг и **возвращает CSV файлом**
   - Кэш: если `./data/author_{authorid}.csv` уже существует, будет отдан существующий файл
   - Принудительное обновление: `?force=1`
+  - Обогащение деталями: `?enrich=1` (ключевые слова и аннотация)
+  - Перезагрузка деталей: `?enrich=1&enrich_force=1`
   - Также добавляет заголовки:
     - `X-Total-Found-On-Site`
     - `X-Saved-To-Csv`
+    - `X-Enriched-Count` (при `enrich=1`)
     - `X-Cache-Hit` (`1` если отдан кэш, иначе `0`)
+- `GET /enrich/{authorid}` — обогатить существующий CSV без повторного парсинга списка
+  - `?enrich_force=1` — перезагрузить детали для всех публикаций
 - `GET /parse_json/{authorid}` — запускает парсинг и возвращает JSON (CSV сохраняется в `./data`)
-  - Поддерживает `?force=1`
+  - Поддерживает `?force=1`, `?enrich=1`, `?enrich_force=1`
 
 Пример:
 
 - CSV: `http://localhost:8000/parse/707733`
 - CSV (force): `http://localhost:8000/parse/707733?force=1`
+- CSV (enrich): `http://localhost:8000/parse/707733?enrich=1`
+- Enrich only: `http://localhost:8000/enrich/707733`
 - JSON: `http://localhost:8000/parse_json/707733`
 - JSON (force): `http://localhost:8000/parse_json/707733?force=1`
 
@@ -53,6 +75,8 @@ docker compose up --build
 - авторы (из блока `font > i`)
 - тип/описание (например, текст свидетельства) из `font` рядом
 - журнал/номер (если есть ссылки `/contents.asp?id=...` и `/contents.asp?...&selid=...`)
+- ключевые слова (при `--enrich` / `?enrich=1`, из ссылок `/keyword_items.asp?id`)
+- аннотация (при обогащении, из `div#abstract1`)
 
 ## Примечание про доступ
 
