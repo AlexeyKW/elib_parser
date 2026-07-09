@@ -7,7 +7,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 
 from parse_elibrary_author import enrich_csv, parse_author_to_csv
-from parse_elibrary_search import _query_to_csv_path, parse_search_to_csv
+from parse_elibrary_search import _query_to_csv_path, enrich_search_csv, parse_search_to_csv
 
 
 app = FastAPI(title="elib_parser", version="1.0.0")
@@ -173,31 +173,88 @@ def search(
     q: str = Query(..., min_length=2, description="Текст поискового запроса"),
     max_pages: int = Query(default=1, ge=1, le=1000, description="Сколько страниц парсить"),
     force: int = Query(default=0, ge=0, le=1),
+    enrich: int = Query(default=0, ge=0, le=1),
+    enrich_force: int = Query(default=0, ge=0, le=1),
 ):
     """Поиск публикаций на elibrary.ru и возврат CSV."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     out_path = DATA_DIR / _query_to_csv_path(q)
 
-    cache_hit = out_path.exists() and not force
+    cache_hit = out_path.exists() and not force and not enrich
     total_found = None
     saved = 0
+    enriched = None
+    enrich_skipped = None
 
     if cache_hit:
         saved = _csv_saved_count(out_path)
     else:
-        try:
-            total_found, saved = parse_search_to_csv(
-                q,
-                str(out_path),
-                max_pages=max_pages,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+        if force or not out_path.exists():
+            try:
+                total_found, saved = parse_search_to_csv(
+                    q,
+                    str(out_path),
+                    max_pages=max_pages,
+                    enrich=False,
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        if enrich:
+            if not out_path.exists():
+                raise HTTPException(status_code=404, detail=f"CSV not found: {out_path}")
+            try:
+                total_rows, enriched, enrich_skipped = enrich_search_csv(
+                    str(out_path),
+                    skip_fetched=not enrich_force,
+                    force=bool(enrich_force),
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+            if not saved:
+                saved = total_rows
 
     headers = {"X-Saved-To-Csv": str(saved), "X-Cache-Hit": "1" if cache_hit else "0"}
     if total_found is not None:
         headers["X-Total-Found-On-Site"] = str(total_found)
+    if enriched is not None:
+        headers["X-Enriched-Count"] = str(enriched)
+    if enrich_skipped is not None:
+        headers["X-Enrich-Skipped"] = str(enrich_skipped)
 
+    return FileResponse(
+        path=str(out_path),
+        media_type="text/csv; charset=utf-8",
+        filename=out_path.name,
+        headers=headers,
+    )
+
+
+@app.get("/enrich_search")
+def enrich_search_only(
+    q: str = Query(..., min_length=1, description="Текст запроса (имя CSV)"),
+    enrich_force: int = Query(default=0, ge=0, le=1),
+):
+    """Обогатить существующий CSV поиска без повторного парсинга списка."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = DATA_DIR / _query_to_csv_path(q)
+    if not out_path.exists():
+        raise HTTPException(status_code=404, detail=f"CSV not found: {out_path}")
+
+    try:
+        total, enriched, skipped = enrich_search_csv(
+            str(out_path),
+            skip_fetched=not enrich_force,
+            force=bool(enrich_force),
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    headers = {
+        "X-Saved-To-Csv": str(total),
+        "X-Enriched-Count": str(enriched),
+        "X-Enrich-Skipped": str(skipped),
+    }
     return FileResponse(
         path=str(out_path),
         media_type="text/csv; charset=utf-8",

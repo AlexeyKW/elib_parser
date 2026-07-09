@@ -15,6 +15,7 @@ python -m pip install -r requirements.txt
 ```bash
 python parse_elibrary_author.py --authorid 707733
 ```
+По умолчанию создаст файл `author_707733.csv` (кодировка `UTF-8-SIG`).
 
 ### Парсинг результатов поиска
 
@@ -25,7 +26,20 @@ python parse_elibrary_search.py "geoai" --max-pages 3
 
 По умолчанию CSV сохраняется с именем, совпадающим с текстом запроса (например, `geoai.csv`).
 
-По умолчанию создаст файл `author_707733.csv` (кодировка `UTF-8-SIG`, удобно для Excel).
+### Обогащение результатов поиска (ключевые слова и аннотация)
+
+```bash
+# Список + детали за один запуск
+python parse_elibrary_search.py "geoai" --max-pages 1 --enrich
+
+# Только обогатить существующий CSV
+python parse_elibrary_search.py "geoai" --enrich-only
+
+# Перезагрузить детали для всех публикаций
+python parse_elibrary_search.py "geoai" --enrich-only --enrich-force
+```
+
+При обогащении колонка `query` сохраняется. Прогресс записывается после каждой публикации; строки с `details_fetched=1` пропускаются.
 
 ### Обогащение (ключевые слова и аннотация)
 
@@ -68,7 +82,11 @@ docker compose up --build
 - `GET /search?q=...` — поиск публикаций и **возврат CSV файлом**
   - `?max_pages=3` — сколько страниц результатов парсить (по умолчанию 1)
   - `?force=1` — принудительно выполнить поиск заново
-  - Заголовки: `X-Total-Found-On-Site`, `X-Saved-To-Csv`, `X-Cache-Hit`
+  - `?enrich=1` — обогатить ключевыми словами и аннотацией
+  - `?enrich=1&enrich_force=1` — перезагрузить детали для всех публикаций
+  - Заголовки: `X-Total-Found-On-Site`, `X-Saved-To-Csv`, `X-Enriched-Count`, `X-Cache-Hit`
+- `GET /enrich_search?q=...` — обогатить существующий CSV поиска без повторного парсинга
+  - `?enrich_force=1` — перезагрузить детали для всех публикаций
 - `GET /enrich/{authorid}` — обогатить существующий CSV без повторного парсинга списка
   - `?enrich_force=1` — перезагрузить детали для всех публикаций
 - `GET /parse_json/{authorid}` — запускает парсинг и возвращает JSON (CSV сохраняется в `./data`)

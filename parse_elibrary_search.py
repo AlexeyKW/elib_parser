@@ -9,13 +9,13 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 from parse_elibrary_author import (
-    ACCESS_ERROR_MARKERS,
     BASE_URL,
     _clean_space,
     _extract_total_found,
     _fetch_html,
     _looks_like_access_error,
     _make_session,
+    _parse_item_details,
     _parse_publications_from_html,
     _post_html,
     _sleep_polite,
@@ -34,6 +34,9 @@ SEARCH_CSV_FIELDNAMES = [
     "journal_url",
     "issue",
     "issue_url",
+    "keywords",
+    "abstract",
+    "details_fetched",
 ]
 
 
@@ -49,6 +52,9 @@ class SearchPublication:
     journal_url: str
     issue: str
     issue_url: str
+    keywords: str = ""
+    abstract: str = ""
+    details_fetched: str = ""
 
 
 def _default_search_payload(query: str) -> dict[str, str]:
@@ -144,7 +150,34 @@ def _search_publication_to_row(p: SearchPublication) -> dict[str, str]:
         "journal_url": p.journal_url,
         "issue": p.issue,
         "issue_url": p.issue_url,
+        "keywords": p.keywords,
+        "abstract": p.abstract,
+        "details_fetched": p.details_fetched,
     }
+
+
+def _search_publication_from_row(row: dict[str, str]) -> SearchPublication:
+    return SearchPublication(
+        query=row.get("query", ""),
+        item_id=row.get("item_id") or None,
+        item_url=row.get("item_url", ""),
+        title=row.get("title", ""),
+        authors=row.get("authors", ""),
+        certificate_or_type=row.get("certificate_or_type", ""),
+        journal_name=row.get("journal_name", ""),
+        journal_url=row.get("journal_url", ""),
+        issue=row.get("issue", ""),
+        issue_url=row.get("issue_url", ""),
+        keywords=row.get("keywords", ""),
+        abstract=row.get("abstract", ""),
+        details_fetched=row.get("details_fetched", ""),
+    )
+
+
+def load_search_csv(path: str) -> list[SearchPublication]:
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        return [_search_publication_from_row(row) for row in reader]
 
 
 def _parse_search_publications_from_html(query: str, html: str) -> list[SearchPublication]:
@@ -186,6 +219,108 @@ def save_search_csv(path: str, pubs: list[SearchPublication]) -> None:
         w.writeheader()
         for p in pubs:
             w.writerow(_search_publication_to_row(p))
+
+
+def enrich_search_publications(
+    pubs: list[SearchPublication],
+    session,
+    *,
+    skip_fetched: bool = True,
+    save_path: Optional[str] = None,
+) -> tuple[int, int]:
+    """
+    Fetch keywords and abstract for each publication via item_url.
+
+    Returns (enriched_count, skipped_count).
+    If save_path is set, writes CSV after each successful item fetch (resume-friendly).
+    """
+    enriched = 0
+    skipped = 0
+    result = list(pubs)
+
+    for i, p in enumerate(result):
+        if skip_fetched and p.details_fetched == "1":
+            skipped += 1
+            continue
+        if not p.item_url:
+            skipped += 1
+            continue
+
+        _sleep_polite(0.7, 1.6)
+        html = _fetch_html(session, p.item_url)
+        if _looks_like_access_error(html):
+            raise RuntimeError(
+                f"eLibrary вернул ошибку доступа при загрузке {p.item_url}."
+            )
+
+        keywords, abstract = _parse_item_details(html)
+        result[i] = SearchPublication(
+            query=p.query,
+            item_id=p.item_id,
+            item_url=p.item_url,
+            title=p.title,
+            authors=p.authors,
+            certificate_or_type=p.certificate_or_type,
+            journal_name=p.journal_name,
+            journal_url=p.journal_url,
+            issue=p.issue,
+            issue_url=p.issue_url,
+            keywords=keywords,
+            abstract=abstract,
+            details_fetched="1",
+        )
+        enriched += 1
+
+        if save_path:
+            save_search_csv(save_path, result)
+
+    return enriched, skipped
+
+
+def enrich_search_csv(
+    path: str,
+    *,
+    skip_fetched: bool = True,
+    force: bool = False,
+) -> tuple[int, int, int]:
+    """
+    Enrich an existing search CSV with keywords and abstract.
+
+    Returns (total_rows, enriched_count, skipped_count).
+    """
+    pubs = load_search_csv(path)
+    if not pubs:
+        return 0, 0, 0
+
+    if force:
+        pubs = [
+            SearchPublication(
+                query=p.query,
+                item_id=p.item_id,
+                item_url=p.item_url,
+                title=p.title,
+                authors=p.authors,
+                certificate_or_type=p.certificate_or_type,
+                journal_name=p.journal_name,
+                journal_url=p.journal_url,
+                issue=p.issue,
+                issue_url=p.issue_url,
+                keywords=p.keywords,
+                abstract=p.abstract,
+                details_fetched="",
+            )
+            for p in pubs
+        ]
+
+    session = _make_session()
+    _warmup_session(session)
+    enriched, skipped = enrich_search_publications(
+        pubs,
+        session,
+        skip_fetched=skip_fetched,
+        save_path=path,
+    )
+    return len(pubs), enriched, skipped
 
 
 def _submit_search(session, query: str) -> str:
@@ -254,6 +389,8 @@ def parse_search_to_csv(
     out_path: Optional[str] = None,
     *,
     max_pages: int = 1,
+    enrich: bool = False,
+    enrich_force: bool = False,
 ) -> tuple[Optional[int], int]:
     """
     Выполняет поиск на elibrary.ru и сохраняет результаты в CSV.
@@ -284,12 +421,16 @@ def parse_search_to_csv(
             all_pubs.append(p)
 
     save_search_csv(out, all_pubs)
+
+    if enrich:
+        enrich_search_csv(out, skip_fetched=not enrich_force, force=enrich_force)
+
     return total_found, len(all_pubs)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Парсер результатов поиска elibrary.ru")
-    ap.add_argument("query", help="Текст поискового запроса (ftext)")
+    ap.add_argument("query", nargs="?", help="Текст поискового запроса (ftext)")
     ap.add_argument(
         "--out",
         default="",
@@ -301,18 +442,55 @@ def main() -> int:
         default=1,
         help="Сколько страниц результатов парсить (по умолчанию 1)",
     )
+    ap.add_argument(
+        "--enrich",
+        action="store_true",
+        help="После парсинга списка обогатить CSV ключевыми словами и аннотациями",
+    )
+    ap.add_argument(
+        "--enrich-only",
+        action="store_true",
+        help="Только обогатить существующий CSV (без повторного парсинга списка)",
+    )
+    ap.add_argument(
+        "--enrich-force",
+        action="store_true",
+        help="Перезагрузить детали для всех публикаций, даже если уже обогащены",
+    )
     args = ap.parse_args()
 
     out = args.out.strip() or None
+
+    if args.enrich_only:
+        if not args.query and not out:
+            raise SystemExit("Укажите запрос или --out для --enrich-only")
+        csv_path = out or _query_to_csv_path(args.query or "")
+        if not os.path.exists(csv_path):
+            raise SystemExit(f"CSV не найден: {csv_path}")
+        total, enriched, skipped = enrich_search_csv(
+            csv_path,
+            skip_fetched=not args.enrich_force,
+            force=args.enrich_force,
+        )
+        print(f"Enriched: {enriched}, skipped: {skipped}, total: {total} ({csv_path})")
+        return 0
+
+    if not args.query:
+        raise SystemExit("Укажите текст поискового запроса")
+
     total_found, saved = parse_search_to_csv(
         args.query,
         out,
         max_pages=max(1, args.max_pages),
+        enrich=args.enrich,
+        enrich_force=args.enrich_force,
     )
     csv_path = _query_to_csv_path(args.query, out)
     if total_found is not None:
         print(f"Total found on site: {total_found}")
     print(f"Saved to CSV: {saved} ({csv_path})")
+    if args.enrich:
+        print("(Details enrichment completed during parse)")
     return 0
 
 
