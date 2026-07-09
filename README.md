@@ -10,9 +10,20 @@ python -m pip install -r requirements.txt
 
 ## Запуск
 
+### Парсинг публикаций автора
+
 ```bash
 python parse_elibrary_author.py --authorid 707733
 ```
+
+### Парсинг результатов поиска
+
+```bash
+python parse_elibrary_search.py "машинное обучение"
+python parse_elibrary_search.py "geoai" --max-pages 3
+```
+
+По умолчанию CSV сохраняется с именем, совпадающим с текстом запроса (например, `geoai.csv`).
 
 По умолчанию создаст файл `author_707733.csv` (кодировка `UTF-8-SIG`, удобно для Excel).
 
@@ -54,6 +65,10 @@ docker compose up --build
     - `X-Saved-To-Csv`
     - `X-Enriched-Count` (при `enrich=1`)
     - `X-Cache-Hit` (`1` если отдан кэш, иначе `0`)
+- `GET /search?q=...` — поиск публикаций и **возврат CSV файлом**
+  - `?max_pages=3` — сколько страниц результатов парсить (по умолчанию 1)
+  - `?force=1` — принудительно выполнить поиск заново
+  - Заголовки: `X-Total-Found-On-Site`, `X-Saved-To-Csv`, `X-Cache-Hit`
 - `GET /enrich/{authorid}` — обогатить существующий CSV без повторного парсинга списка
   - `?enrich_force=1` — перезагрузить детали для всех публикаций
 - `GET /parse_json/{authorid}` — запускает парсинг и возвращает JSON (CSV сохраняется в `./data`)
